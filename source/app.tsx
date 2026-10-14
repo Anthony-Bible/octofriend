@@ -59,8 +59,8 @@ import {
   PermissionUiState,
   inputFieldAvailable,
   userMessageContent,
-  MAX_RETRY_COUNT,
 } from "./state.ts";
+import { MAX_RETRY_COUNT } from "./octo-trajectory.ts";
 import type {
   TrajectoryMode,
   RetryControl,

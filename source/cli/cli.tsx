@@ -45,6 +45,7 @@ import { ToastProvider } from "../components/toast.tsx";
 import { setOctoTitles } from "./titles.ts";
 import changelog from "../../CHANGELOG.md" with { type: "text" };
 import { processes } from "../process-manager.ts";
+import { Readable, Writable } from "stream";
 
 const INTERACTIVE_RENDER_OPTIONS = {
   alternateScreen: true,
@@ -218,17 +219,7 @@ async function runMain(opts: {
   transport: Transport;
   loadedSession?: LoadedSession | null;
 }) {
-  const restoreTitles = setOctoTitles();
-  let cleanedUp = false;
-  const cleanup = async () => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    restoreTitles();
-    await Promise.all([shutdownLspClients(), shutdownMcpClients()]);
-  };
-  const unregisterCleanup = processes.manager().registerOctoExitCleanup(cleanup);
-
-  try {
+  await withOctoExitCleanup(setOctoTitles(), async () => {
     const { config, configPath } = await loadConfig(opts.parsedCliArgs.config);
 
     // Connect to all MCP servers on boot
@@ -315,11 +306,63 @@ async function runMain(opts: {
         console.log(`${model}: ${input} input, ${output} output`);
       }
     }
+  });
+}
+
+// Cleanup runs once, on exit or after body: beforeShutdown, then LSP and MCP shutdown.
+async function withOctoExitCleanup(
+  beforeShutdown: () => void | Promise<void>,
+  body: () => Promise<void>,
+) {
+  let cleanedUp = false;
+  const cleanup = async () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    await beforeShutdown();
+    await Promise.all([shutdownLspClients(), shutdownMcpClients()]);
+  };
+  const unregisterCleanup = processes.manager().registerOctoExitCleanup(cleanup);
+  try {
+    await body();
   } finally {
     await processes.manager().terminateOnOctoExit();
     unregisterCleanup();
   }
 }
+
+withOctoFlags(cli.command("acp"))
+  .description("Serve the Agent Client Protocol over stdio, for editors like Zed")
+  .action(async opts => {
+    // stdout carries JSON-RPC: anything else logged there would corrupt the stream.
+    console.log = console.error;
+    console.info = console.error;
+
+    let found;
+    try {
+      found = await findConfig(opts.config);
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exitCode = 1;
+      return;
+    }
+    if (found == null) {
+      console.error("No Octo config found: run `octo` once to set up.");
+      process.exitCode = 1;
+      return;
+    }
+
+    // Lazy import: the ACP SDK builds its schemas at import time.
+    const { runAcpServer } = await import("../acp/server.ts");
+    const server = runAcpServer({
+      config: found.config,
+      configPath: opts.config,
+      unchained: !!opts.unchained,
+      // Node types web streams from node:stream/web, which TS sees as distinct from the DOM ones.
+      input: Readable.toWeb(process.stdin) as unknown as ReadableStream<Uint8Array>,
+      output: Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+    });
+    await withOctoExitCleanup(server.close, () => server.closed);
+  });
 
 cli
   .command("version")
@@ -793,19 +836,18 @@ async function loadConfig(path?: string) {
   };
 }
 
-async function loadConfigWithoutReauth(configPath?: string) {
-  if (configPath)
-    return {
-      configPath,
-      config: await readConfig(configPath),
-    };
-
+// Returns null when no config exists yet.
+async function findConfig(configPath?: string) {
+  if (configPath) return { configPath, config: await readConfig(configPath) };
   if (await fileExists(CONFIG_JSON5_FILE)) {
-    return {
-      configPath: CONFIG_JSON5_FILE,
-      config: await readConfig(CONFIG_JSON5_FILE),
-    };
+    return { configPath: CONFIG_JSON5_FILE, config: await readConfig(CONFIG_JSON5_FILE) };
   }
+  return null;
+}
+
+async function loadConfigWithoutReauth(configPath?: string) {
+  const found = await findConfig(configPath);
+  if (found != null) return found;
 
   // This is first-time setup; mark all updates as seen to avoid showing an update message on boot
   await markUpdatesSeen();

@@ -75,8 +75,7 @@ describe("Transport.backgroundShell", () => {
 
   it("uses the transport's working directory", async () => {
     const cwd = await realpath(await mkdtemp(path.join(tmpdir(), "octo-background-")));
-    const transport = new LocalTransport();
-    transport.cwd = cwd;
+    const transport = new LocalTransport(cwd);
     try {
       const background = unwrap(
         transport.backgroundShell({

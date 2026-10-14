@@ -22,11 +22,21 @@ const KILL_GRACE_MS = 500;
 const STRIPPED_ENV_VARS = ["NODE_ENV", "NAPI_RS_NATIVE_LIBRARY_PATH", "CANARY_OCTO"];
 
 export class LocalTransport implements Transport {
-  cwd = process.cwd();
+  readonly cwd: string;
   // bash over sh: available on most local setups, and tolerant of LLM bash-isms
   readonly commandShell = "bash";
   private readonly runningProcesses = new Set<TransportProcess>();
   private readonly processManager = processes.manager();
+
+  // Relative paths resolve against cwd, not process.cwd(), so a transport can serve another
+  // project.
+  constructor(cwd = process.cwd()) {
+    this.cwd = cwd;
+  }
+
+  private abs(file: string): string {
+    return path.resolve(this.cwd, file);
+  }
 
   async close() {
     await Promise.all(
@@ -81,16 +91,16 @@ export class LocalTransport implements Transport {
   }
 
   async writeFile(_: AbortSignal, file: string, contents: string) {
-    return await fs.writeFile(file, contents, "utf8");
+    return await fs.writeFile(this.abs(file), contents, "utf8");
   }
 
   async readFile(_: AbortSignal, file: string) {
-    return await fs.readFile(file, "utf8");
+    return await fs.readFile(this.abs(file), "utf8");
   }
 
   async modTime(_: AbortSignal, file: string) {
     try {
-      const stat = await fs.stat(file);
+      const stat = await fs.stat(this.abs(file));
       return stat.mtimeMs;
     } catch (e) {
       throw new TransportError(`Could not get modified time for ${file}: ${e}`);
@@ -99,23 +109,24 @@ export class LocalTransport implements Transport {
 
   async resolvePath(_: AbortSignal, file: string) {
     try {
-      return await fs.realpath(file);
+      return await fs.realpath(this.abs(file));
     } catch {
-      return path.resolve(file);
+      return this.abs(file);
     }
   }
 
   async mkdir(_: AbortSignal, dirpath: string) {
-    await fs.mkdir(dirpath, { recursive: true });
+    await fs.mkdir(this.abs(dirpath), { recursive: true });
   }
 
   async readdir(_: AbortSignal, dirpath: string) {
-    const entries = await fs.readdir(dirpath, { withFileTypes: true });
+    const dir = this.abs(dirpath);
+    const entries = await fs.readdir(dir, { withFileTypes: true });
     return Promise.all(
       entries.map(async entry => {
         // For symlinks, resolve to determine if target is a directory
         if (entry.isSymbolicLink()) {
-          const fullPath = path.join(dirpath, entry.name);
+          const fullPath = path.join(dir, entry.name);
           try {
             const stat = await fs.stat(fullPath); // follows symlinks
             return { entry: entry.name, isDirectory: stat.isDirectory() };
@@ -140,7 +151,7 @@ export class LocalTransport implements Transport {
 
   async isDirectory(_: AbortSignal, file: string) {
     try {
-      const stat = await fs.stat(file);
+      const stat = await fs.stat(this.abs(file));
       return stat.isDirectory();
     } catch {
       return false;

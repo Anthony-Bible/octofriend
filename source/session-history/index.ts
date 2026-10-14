@@ -16,7 +16,8 @@ import {
   trees,
 } from "./schema/session-history-schema.ts";
 import { deserializeLlmIr, serializeLlmIr } from "./llm-ir-json.ts";
-import { NO_MODEL_RECORDED } from "./model-json.ts";
+import { NO_MODEL_RECORDED, serializeModelJson } from "./model-json.ts";
+import type { ModelConfig } from "../config.ts";
 import { excerpt } from "../str.ts";
 
 export type TransportKind = "local" | "docker-connect" | "docker-run";
@@ -68,9 +69,14 @@ export function latestModelJson(history: readonly HistoryNode[]): string | null 
   return history.at(-1)?.modelJson ?? null;
 }
 
-export function createSession(cwd: string, cliArgs: ParsedCliArgs): Session {
+// Without a sessionId, one is generated on first write.
+export function createSession(
+  cwd: string,
+  cliArgs: ParsedCliArgs,
+  sessionId: string | null = null,
+): Session {
   return {
-    metadata: { sessionId: null, cwd, cliArgs },
+    metadata: { sessionId, cwd, cliArgs },
     treeId: null,
     launchId: null,
   };
@@ -470,4 +476,18 @@ function insertHistoryItem(tx: DbTransaction, item: HistoryItem, modelJson: stri
     .returning({ id: historyItems.id })
     .get();
   return insertedHistoryItem.id;
+}
+
+// Persists items as children of the last history node and returns the extended history.
+export function appendAndPersistHistory(
+  session: Session,
+  prevHistory: readonly HistoryNode[],
+  itemsToInsert: HistoryItem[],
+  model: ModelConfig,
+): HistoryNode[] {
+  const parentNodeId = prevHistory.at(-1)?.nodeId ?? null;
+  return [
+    ...prevHistory,
+    ...insertHistoryItems(session, parentNodeId, itemsToInsert, serializeModelJson(model)),
+  ];
 }

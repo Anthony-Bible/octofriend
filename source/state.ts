@@ -1,18 +1,10 @@
-import {
-  Config,
-  ModelConfig,
-  useConfig,
-  getModelFromConfig,
-  readAuthForModel,
-  runNotifyCommand,
-} from "./config.ts";
+import { Config, ModelConfig, useConfig, getModelFromConfig, runNotifyCommand } from "./config.ts";
 import { ImageInfo } from "./utils/image-utils.ts";
 import {
+  appendAndPersistHistory,
   createSession,
   HistoryNode,
-  insertHistoryItems,
   latestModelJson,
-  HistoryItem,
   Session,
   SessionNotFoundError,
 } from "./session-history/index.ts";
@@ -28,31 +20,19 @@ import { toLlmIR } from "./ir/convert-history-ir.ts";
 import { Transport } from "./transports/transport-common.ts";
 import { run, type ModelData } from "./compilers/run.ts";
 import type { Compiler } from "./libocto/compilers/compiler-interface.ts";
-import { lowerOcto } from "./compilers/lower-octo.ts";
-import { autofixEdit, makeAutofixJson } from "./compilers/autofix.ts";
-import { systemPrompt } from "./prompts/system-prompt.ts";
-import { messageText, type UserMessage } from "./libocto/llm-ir.ts";
-import { err, ok, type Result } from "./libocto/result.ts";
+import type { UserMessage } from "./libocto/llm-ir.ts";
+import { Trajectory, type TrajectoryMode } from "./libocto/trajectory.ts";
+import { buildOctoTrajectoryParams } from "./octo-trajectory.ts";
 import {
-  Trajectory,
-  DEFAULT_MAX_TOOL_OUTPUT_FRACTION,
-  type TrajectoryMode,
-  type TrajectoryModelError,
-} from "./libocto/trajectory.ts";
-import {
+  autoAllowed,
   octoPermissionGate,
-  whitelistKey,
   type OctoGateState,
   type OctoPermissionControl,
   type RejectionTransaction,
 } from "./octo-permissions.ts";
 import { parseQuotaJson, QuotaData } from "./utils/quota.ts";
 import { throttledBuffer } from "./throttled-buffer.ts";
-import { loadTools, SKIP_CONFIRMATION_TOOLS } from "./tools/index.ts";
-import { estimateTokens } from "./ir/count-ir-tokens.ts";
 import { octoAgent, type OctoIR } from "./ir/octo-ir.ts";
-
-export const MAX_RETRY_COUNT = 20;
 
 export type InflightResponseType = {
   type: "inflight-response";
@@ -116,8 +96,6 @@ export function userMessageContent(query: string, images?: ImageInfo[]): UserMes
 // Maps each trajectory IR to its persisted history node, so a rewind can find the history
 // prefix to keep. IRs are seeded and appended by unique object identity, never reconstructed.
 const irNodeMap = new WeakMap<OctoIR, HistoryNode>();
-
-const PREVIEW_CHARS = 200;
 
 export type UiState = {
   isMenuOpen: boolean;
@@ -186,19 +164,6 @@ export function inputFieldAvailable(
   }
 }
 
-function appendAndPersistHistory(
-  session: Session,
-  prevHistory: readonly HistoryNode[],
-  itemsToInsert: HistoryItem[],
-  model: ModelConfig,
-): HistoryNode[] {
-  const parentNodeId = prevHistory.at(-1)?.nodeId ?? null;
-  return [
-    ...prevHistory,
-    ...insertHistoryItems(session, parentNodeId, itemsToInsert, serializeModelJson(model)),
-  ];
-}
-
 export const useAppStore = create<UiState>((set, get) => {
   const currentConfig = (): Config => {
     const mode = get().sessionMode;
@@ -248,234 +213,165 @@ export const useAppStore = create<UiState>((set, get) => {
       whitelistState: get().whitelistState,
     };
 
-    const instance = new Trajectory({
-      agent: octoAgent,
-      messages: toLlmIR([...history]),
-      abortSignal: exitController.signal,
-      systemPrompt: signal => systemPrompt({ config: currentConfig(), transport, signal }),
-      model: async (): Promise<
-        Result<{ model: ModelData; contextWindow: number }, TrajectoryModelError>
-      > => {
-        const model = currentModel();
-        if (model.type === "codex") {
-          const authResult = await readAuthForModel(model, currentConfig());
-          if (!authResult.ok) {
-            return err({ type: "auth-error", authError: authResult.error.message });
-          }
-          return ok({
-            model: { type: "codex", auth: authResult.auth, model },
-            contextWindow: model.context,
-          });
-        }
-        const authResult = await readAuthForModel(model, currentConfig());
-        if (!authResult.ok) {
-          return err({ type: "auth-error", authError: authResult.error.message });
-        }
-        return ok({
-          model: { type: "api", auth: authResult.auth, model },
-          contextWindow: model.context,
-        });
-      },
-      loadTools: signal => loadTools(transport, signal, currentConfig()),
-      countTokens: irs => irs.reduce((tokens, ir) => tokens + estimateTokens(messageText(ir)), 0),
-      toolContentTooLargeError: async ir => {
-        let text = "";
-        if (ir.role === "tool-output") {
-          for (const part of ir.content) {
-            if (part.type === "text") text += part.content;
-          }
-        } else if (ir.role === "file-read" || ir.role === "file-mutate") {
-          text = ir.content;
-        }
-        const model = currentModel();
-        const tokens = estimateTokens(text);
-        const preview = text.slice(0, PREVIEW_CHARS);
-        return (
-          `Tool output was too large: approximately ${tokens} tokens, which is ` +
-          `${DEFAULT_MAX_TOOL_OUTPUT_FRACTION * 100}% or more of the model's ` +
-          `${model.context}-token context window. The output was discarded to protect the ` +
-          `context window. Retry with a more targeted approach: page through the file with ` +
-          `partial-read using offset/limit, narrow searches with tighter patterns or ` +
-          `maxResults, or limit shell output (e.g. pipe through head/tail/grep). Before it ` +
-          `was discarded, the first ${PREVIEW_CHARS} characters were preserved so you can ` +
-          `inspect them; here they are:\n${preview}`
-        );
-      },
-      toolData: config,
-      runCompiler,
-      lowerMessages: messages => lowerOcto(messages, currentModel().modalities),
-      transport,
-      errorCorrection: {
-        json: makeAutofixJson(config),
-        tools: {
-          edit: async ({ toolCall, abortSignal: fixSignal, transport: fixTransport }) => {
-            const file = await fixTransport.readFile(fixSignal, toolCall.parsed.filePath);
-            const fix = await autofixEdit(config, file, toolCall.parsed, fixSignal);
-            if (fix == null) return null;
-            return { ...toolCall.parsed, ...fix };
+    const instance = new Trajectory(
+      buildOctoTrajectoryParams({
+        config,
+        liveConfig: currentConfig,
+        model: currentModel,
+        transport,
+        messages: toLlmIR([...history]),
+        runCompiler,
+        abortSignal: exitController.signal,
+        permission: octoPermissionGate({
+          state: gateState,
+          onWhitelist: whitelistState => {
+            gateState.whitelistState = whitelistState;
+            set({ whitelistState });
           },
-        },
-      },
-      requestErrorRetries: {
-        maxRetryCount: MAX_RETRY_COUNT,
-        backoffMs: 2000,
-        maxBackoffMs: 30_000,
-      },
-      permission: octoPermissionGate({
-        state: gateState,
-        onWhitelist: whitelistState => {
-          gateState.whitelistState = whitelistState;
-          set({ whitelistState });
-        },
-        onBeginRejection: rejectionTx => {
-          if (!isCurrent()) return;
-          setPermissionUi({ type: "awaiting-steering", rejectionTx });
-        },
-        onCommitRejection: () => {
-          if (!isCurrent()) return;
-          setPermissionUi({ type: "idle" });
-        },
-        controller: control => {
-          if (!isCurrent()) {
-            control.allow();
-            return;
-          }
-          const { unchained, whitelistState } = get();
-          const toolCall = control.toolCall;
-          if (
-            unchained ||
-            SKIP_CONFIRMATION_TOOLS.includes(toolCall.name) ||
-            whitelistState.has(whitelistKey(toolCall))
-          ) {
-            control.allow();
-            return;
-          }
-          setPermissionUi({ type: "prompt", control });
-          get().notifyReadyForInput(config);
-        },
-      }),
-      handler: {
-        modeChange: mode => {
-          if (!isCurrent()) return;
-          throttle.flush();
-          set(state => {
-            if (state.sessionMode.mode !== "live") return {};
-            const streaming = mode.mode === "responding" || mode.mode === "compacting";
-            return {
-              sessionMode: {
-                ...state.sessionMode,
-                liveMode: { trajectoryMode: mode, permissionUi: { type: "idle" } },
-              },
-              inflightResponse: streaming ? state.inflightResponse : null,
-              byteCount: streaming ? state.byteCount : 0,
-            };
-          });
-          if (mode.mode === "ready-for-request") get().notifyReadyForInput(config);
-        },
-        onMessage: ir => {
-          if (!isCurrent()) return;
-          throttle.flush();
-          try {
-            set(state => ({
-              history: appendAndPersistHistory(
-                session,
-                state.history,
-                [{ type: "llm-ir", ir }],
-                currentModel(),
-              ),
-            }));
-          } catch (e) {
-            if (e instanceof SessionNotFoundError) {
-              set(state =>
-                state.sessionMode.mode !== "live"
-                  ? {}
-                  : {
-                      sessionMode: {
-                        mode: "lost",
-                        config: state.sessionMode.config,
-                        transport: state.sessionMode.transport,
-                        sessionId: session.metadata.sessionId,
-                        sessionLostError: e.message,
-                      },
-                    },
-              );
-              exitController.abort();
+          onBeginRejection: rejectionTx => {
+            if (!isCurrent()) return;
+            setPermissionUi({ type: "awaiting-steering", rejectionTx });
+          },
+          onCommitRejection: () => {
+            if (!isCurrent()) return;
+            setPermissionUi({ type: "idle" });
+          },
+          controller: control => {
+            if (!isCurrent()) {
+              control.allow();
               return;
             }
-            throw e;
-          }
-          const node = get().history.at(-1);
-          if (node != null) irNodeMap.set(ir, node);
-        },
-        rewind: ({ removed, content }) => {
-          if (!isCurrent()) return;
-          set(state => {
-            let history = state.history;
-            if (removed.length > 0) {
-              const first = irNodeMap.get(removed[0]);
-              if (first == null) throw new Error("rewind target is missing from history");
-              history = history.slice(
-                0,
-                history.findIndex(node => node.nodeId === first.nodeId),
-              );
+            if (autoAllowed(control.toolCall, get())) {
+              control.allow();
+              return;
             }
-            const textPart = content?.find(part => part.type === "text");
-            return {
-              history,
-              query: textPart?.content ?? "",
-              clearNonce: state.clearNonce + 1,
-            };
-          });
+            setPermissionUi({ type: "prompt", control });
+            get().notifyReadyForInput(config);
+          },
+        }),
+        handler: {
+          modeChange: mode => {
+            if (!isCurrent()) return;
+            throttle.flush();
+            set(state => {
+              if (state.sessionMode.mode !== "live") return {};
+              const streaming = mode.mode === "responding" || mode.mode === "compacting";
+              return {
+                sessionMode: {
+                  ...state.sessionMode,
+                  liveMode: { trajectoryMode: mode, permissionUi: { type: "idle" } },
+                },
+                inflightResponse: streaming ? state.inflightResponse : null,
+                byteCount: streaming ? state.byteCount : 0,
+              };
+            });
+            if (mode.mode === "ready-for-request") get().notifyReadyForInput(config);
+          },
+          onMessage: ir => {
+            if (!isCurrent()) return;
+            throttle.flush();
+            try {
+              set(state => ({
+                history: appendAndPersistHistory(
+                  session,
+                  state.history,
+                  [{ type: "llm-ir", ir }],
+                  currentModel(),
+                ),
+              }));
+            } catch (e) {
+              if (e instanceof SessionNotFoundError) {
+                set(state =>
+                  state.sessionMode.mode !== "live"
+                    ? {}
+                    : {
+                        sessionMode: {
+                          mode: "lost",
+                          config: state.sessionMode.config,
+                          transport: state.sessionMode.transport,
+                          sessionId: session.metadata.sessionId,
+                          sessionLostError: e.message,
+                        },
+                      },
+                );
+                exitController.abort();
+                return;
+              }
+              throw e;
+            }
+            const node = get().history.at(-1);
+            if (node != null) irNodeMap.set(ir, node);
+          },
+          rewind: ({ removed, content }) => {
+            if (!isCurrent()) return;
+            set(state => {
+              let history = state.history;
+              if (removed.length > 0) {
+                const first = irNodeMap.get(removed[0]);
+                if (first == null) throw new Error("rewind target is missing from history");
+                history = history.slice(
+                  0,
+                  history.findIndex(node => node.nodeId === first.nodeId),
+                );
+              }
+              const textPart = content?.find(part => part.type === "text");
+              return {
+                history,
+                query: textPart?.content ?? "",
+                clearNonce: state.clearNonce + 1,
+              };
+            });
+          },
+          steeringChange: ({ queued }) => {
+            if (!isCurrent()) return;
+            set({ queuedSteering: queued });
+          },
+          startResponse: () => {
+            if (!isCurrent()) return;
+            throttle.flush();
+            responseByteCount = 0;
+            set({ inflightResponse: { type: "inflight-response", content: "" }, byteCount: 0 });
+          },
+          responseProgress: event => {
+            if (!isCurrent()) return;
+            responseByteCount += event.delta.value.length;
+            throttle.emit({
+              inflightResponse: {
+                type: "inflight-response",
+                reasoningContent: event.buffer.reasoning,
+                content: event.buffer.content || "",
+              },
+              byteCount: responseByteCount,
+            });
+          },
+          startCompaction: () => {
+            if (!isCurrent()) return;
+            throttle.flush();
+            compactionByteCount = 0;
+            set({ inflightResponse: { type: "inflight-response", content: "" }, byteCount: 0 });
+          },
+          compactionProgress: event => {
+            if (!isCurrent()) return;
+            compactionByteCount += event.delta.value.length;
+            throttle.emit({
+              inflightResponse: {
+                type: "inflight-response",
+                reasoningContent: event.buffer.reasoning,
+                content: event.buffer.content || "",
+              },
+              byteCount: compactionByteCount,
+            });
+          },
+          onResponseHeaders: headers => {
+            if (!isCurrent()) return;
+            const raw = headers.get("x-synthetic-quotas");
+            if (raw == null) return;
+            const quota = parseQuotaJson(raw);
+            if (quota != null) set({ quotaData: quota });
+          },
         },
-        steeringChange: ({ queued }) => {
-          if (!isCurrent()) return;
-          set({ queuedSteering: queued });
-        },
-        startResponse: () => {
-          if (!isCurrent()) return;
-          throttle.flush();
-          responseByteCount = 0;
-          set({ inflightResponse: { type: "inflight-response", content: "" }, byteCount: 0 });
-        },
-        responseProgress: event => {
-          if (!isCurrent()) return;
-          responseByteCount += event.delta.value.length;
-          throttle.emit({
-            inflightResponse: {
-              type: "inflight-response",
-              reasoningContent: event.buffer.reasoning,
-              content: event.buffer.content || "",
-            },
-            byteCount: responseByteCount,
-          });
-        },
-        startCompaction: () => {
-          if (!isCurrent()) return;
-          throttle.flush();
-          compactionByteCount = 0;
-          set({ inflightResponse: { type: "inflight-response", content: "" }, byteCount: 0 });
-        },
-        compactionProgress: event => {
-          if (!isCurrent()) return;
-          compactionByteCount += event.delta.value.length;
-          throttle.emit({
-            inflightResponse: {
-              type: "inflight-response",
-              reasoningContent: event.buffer.reasoning,
-              content: event.buffer.content || "",
-            },
-            byteCount: compactionByteCount,
-          });
-        },
-        onResponseHeaders: headers => {
-          if (!isCurrent()) return;
-          const raw = headers.get("x-synthetic-quotas");
-          if (raw == null) return;
-          const quota = parseQuotaJson(raw);
-          if (quota != null) set({ quotaData: quota });
-        },
-      },
-    });
+      }),
+    );
 
     return {
       instance,

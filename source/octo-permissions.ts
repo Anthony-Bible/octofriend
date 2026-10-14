@@ -3,6 +3,7 @@ import type { ToolCall } from "./libocto/tool-def.ts";
 import type { UserMessage } from "./libocto/llm-ir.ts";
 import type { PermissionDecision, PermissionGate } from "./libocto/permissions.ts";
 import type toolMap from "./tools/tool-defs/index.ts";
+import { SKIP_CONFIRMATION_TOOLS } from "./tools/index.ts";
 
 export type ToolCallRequest = ToolCall<typeof toolMap>;
 
@@ -22,6 +23,17 @@ export type OctoPermissionLifecycle = {
 };
 
 export type OctoPermissionController = (control: OctoPermissionControl) => void | Promise<void>;
+
+export function autoAllowed(
+  toolCall: ToolCallRequest,
+  { unchained, whitelistState }: { unchained: boolean; whitelistState: Set<string> },
+): boolean {
+  return (
+    unchained ||
+    SKIP_CONFIRMATION_TOOLS.includes(toolCall.name) ||
+    whitelistState.has(whitelistKey(toolCall))
+  );
+}
 
 export function whitelistKey(toolCall: ToolCallRequest): string {
   switch (toolCall.name) {
