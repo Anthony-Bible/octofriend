@@ -38,6 +38,9 @@ function toolKind(name: OctoToolName): ToolKind {
     case "skill":
     case "mcp":
       return "other";
+    default:
+      // A tool added without a mapping must not produce an undefined kind.
+      return "other";
   }
 }
 

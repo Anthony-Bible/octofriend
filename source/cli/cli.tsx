@@ -336,6 +336,8 @@ withOctoFlags(cli.command("acp"))
     // stdout carries JSON-RPC: anything else logged there would corrupt the stream.
     console.log = console.error;
     console.info = console.error;
+    console.warn = console.error;
+    console.debug = console.error;
 
     let found;
     try {

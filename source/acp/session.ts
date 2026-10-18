@@ -40,6 +40,9 @@ export type AcpSessionArgs = {
   unchained: boolean;
   client: AgentContext;
   runCompiler: Compiler<ModelData>;
+  // Called when the trajectory reaches its terminal "aborted" mode, so the
+  // server can stop routing to a dead session.
+  onEnd: () => void;
 };
 
 const ALLOW_ONCE = "allow-once";
@@ -55,6 +58,7 @@ export class AcpSession {
   readonly runPromise: Promise<void>;
 
   private readonly client: AgentContext;
+  private readonly onEnd: () => void;
   private readonly model: ModelConfig;
   private readonly unchained: boolean;
   private readonly session: Session;
@@ -69,6 +73,7 @@ export class AcpSession {
     null;
   private cancelRequested = false;
   private interruptPending = false;
+  private shutdownRequested = false;
   // Error modes don't accept steering, so a prompt sent in one retries first and is queued once
   // the retry is running.
   private pendingSteering: UserMessage["content"] | null = null;
@@ -78,6 +83,7 @@ export class AcpSession {
     this.id = args.sessionId;
     this.cwd = args.cwd;
     this.client = args.client;
+    this.onEnd = args.onEnd;
     this.model = getModelFromConfig(args.config, null);
     this.unchained = args.unchained;
     this.session = createSession(
@@ -127,6 +133,11 @@ export class AcpSession {
     );
 
     this.runPromise = this.trajectory.run().catch(e => {
+      if (this.shutdownRequested) {
+        // Tearing down, not crashing: the in-flight turn ends as cancelled.
+        this.settle(t => t.resolve({ stopReason: "cancelled" }));
+        return;
+      }
       this.crashed = e instanceof Error ? e.message : String(e);
       console.error(`ACP session ${this.id} crashed:`, e);
       this.settle(t => t.reject(RequestError.internalError(undefined, this.crashed!)));
@@ -156,12 +167,26 @@ export class AcpSession {
       this.pendingSteering = content;
       mode.control.retry();
     } else if ("control" in mode && "enqueueSteering" in mode.control) {
-      await mode.control.enqueueSteering(content);
+      try {
+        await mode.control.enqueueSteering(content);
+      } catch (e) {
+        // Without this, the turn stays parked forever and every later prompt
+        // fails with "already running".
+        this.turn = null;
+        throw e;
+      }
     } else {
       this.turn = null;
       throw RequestError.invalidRequest(undefined, `Session is busy (${mode.mode})`);
     }
     return await done;
+  }
+
+  // Unanswered tool calls get skip markers, persisted before run() resolves.
+  async shutdown(): Promise<void> {
+    this.shutdownRequested = true;
+    this.exitController.abort();
+    await this.runPromise;
   }
 
   // No-op between turns, including while a rejection is parked.
@@ -176,12 +201,6 @@ export class AcpSession {
       // The trajectory hasn't picked up the prompt yet: interrupt once it can be.
       this.interruptPending = true;
     }
-  }
-
-  // Unanswered tool calls get skip markers, persisted before run() resolves.
-  async shutdown(): Promise<void> {
-    this.exitController.abort();
-    await this.runPromise;
   }
 
   private settle(fn: (turn: NonNullable<AcpSession["turn"]>) => void) {
@@ -217,6 +236,7 @@ export class AcpSession {
         return;
       case "aborted":
         this.settle(t => t.resolve({ stopReason: "cancelled" }));
+        this.onEnd();
         return;
       case "request-error":
       case "compaction-error":
@@ -297,8 +317,22 @@ export class AcpSession {
       return;
     }
 
-    // A cancelled request means session/cancel already interrupted the turn.
-    if (outcome.outcome === "cancelled") return;
+    // A cancelled request after session/cancel means the turn was already interrupted and the
+    // trajectory has moved on: the gate is abandoned, so it must stay unsettled. Without a
+    // cancel, the trajectory is still awaiting this decision: park it like a rejection so the
+    // turn ends and the next prompt steers.
+    if (outcome.outcome === "cancelled") {
+      if (this.cancelRequested || this.turn == null) return;
+      control.beginReject();
+      this.reportedResults.add(toolCall.toolCallId);
+      await this.update({
+        sessionUpdate: "tool_call_update",
+        toolCallId: toolCall.toolCallId,
+        status: "failed",
+      });
+      this.settle(t => t.resolve({ stopReason: "cancelled" }));
+      return;
+    }
     switch (outcome.optionId) {
       case ALLOW_ONCE:
         control.allow();

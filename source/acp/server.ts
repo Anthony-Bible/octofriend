@@ -48,6 +48,9 @@ export function runAcpServer(args: AcpServerArgs): AcpServer {
       if (!path.isAbsolute(params.cwd)) {
         throw acp.RequestError.invalidParams(undefined, "cwd must be an absolute path");
       }
+      if (client == null) {
+        throw acp.RequestError.internalError(undefined, "Connection is not established");
+      }
       const sessionId = crypto.randomUUID();
       sessions.set(
         sessionId,
@@ -57,8 +60,13 @@ export function runAcpServer(args: AcpServerArgs): AcpServer {
           config: args.config,
           configPath: args.configPath,
           unchained: args.unchained,
-          client: client!,
+          client,
           runCompiler,
+          // Aborted sessions are terminal: stop routing to them instead of
+          // accumulating dead entries for the life of the connection.
+          onEnd: () => {
+            sessions.delete(sessionId);
+          },
         }),
       );
       return { sessionId };

@@ -429,6 +429,38 @@ describe("octo acp", () => {
     expect(toolStatuses(h, sessionId, "t1")).toEqual(["pending", "failed"]);
   });
 
+  it("ends the turn when permission is cancelled without session/cancel, and steers next", async () => {
+    const compiler = queued([
+      callsTools(createCall("t1", "notes.txt", "hello")),
+      streamed(["steered"]),
+    ]);
+    const h = await startHarness(compiler.runCompiler);
+    // No session/cancel here: the client answers the permission request alone.
+    h.permission = async () => ({ outcome: { outcome: "cancelled" } });
+    const cwd = await tempCwd();
+    const sessionId = await newSession(h, cwd);
+
+    const cancelled = await prompt(h, sessionId, "write notes");
+
+    expect(cancelled.stopReason).toBe("cancelled");
+    expect(toolStatuses(h, sessionId, "t1")).toEqual(["pending", "failed"]);
+    expect(await fileExists(path.join(cwd, "notes.txt"))).toBe(false);
+    expect(compiler.calls).toHaveLength(1);
+
+    const steered = await prompt(h, sessionId, "use a different file name");
+
+    expect(steered.stopReason).toBe("end_turn");
+    expect(compiler.calls).toHaveLength(2);
+    expect(compiler.calls[1]).toContain("use a different file name");
+    expect(historyRoles(sessionId)).toEqual([
+      "user",
+      "assistant",
+      "tool-reject",
+      "user",
+      "assistant",
+    ]);
+  });
+
   it("fails a turn that ends in an error and recovers on the next prompt", async () => {
     const compiler = queued([paymentError, streamed(["retried"]), streamed([" answered"])]);
     const h = await startHarness(compiler.runCompiler);
